@@ -23,7 +23,7 @@ class WakeWordForegroundService : Service() {
         
         // Static variables to hold configuration
         private var accessKey: String = ""
-        private var builtInKeywords: List<String> = listOf("porcupine", "hey pico")
+    private var builtInKeywords: List<String> = listOf("porcupine")
         private var customKeywordPaths: List<String> = emptyList()
         private var isRunning = false
         
@@ -33,10 +33,12 @@ class WakeWordForegroundService : Service() {
         
         fun setBuiltInKeywords(keywords: List<String>) {
             builtInKeywords = keywords
+            Log.d(TAG, "Built-in keywords set: $keywords")
         }
         
         fun setCustomKeywordPaths(paths: List<String>) {
             customKeywordPaths = paths
+            Log.d(TAG, "Custom keyword paths set: $paths")
         }
         
         fun isServiceRunning(): Boolean {
@@ -100,7 +102,7 @@ class WakeWordForegroundService : Service() {
     private fun createNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("SafeHer Protection Active")
-            .setContentText("Listening for emergency keywords...")
+            .setContentText("Listening for 'help me' and emergency keywords...")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -133,12 +135,16 @@ class WakeWordForegroundService : Service() {
     private fun initializePorcupine() {
         try {
             val builder = Porcupine.Builder().setAccessKey(accessKey)
+            
+            // For "help me" English keyword, use default English model
+            Log.i(TAG, "Using default English model for custom/built-in keywords")
 
-            if (customKeywordPaths.isNotEmpty()) {
-                // Use custom keyword files
-                builder.setKeywordPaths(customKeywordPaths.toTypedArray())
-            } else {
-                // Use built-in keywords
+            // Combine built-in keywords and custom keywords
+            val allKeywordPaths = mutableListOf<String>()
+            val allBuiltInKeywords = mutableListOf<Porcupine.BuiltInKeyword>()
+
+            // Add built-in keywords
+            if (builtInKeywords.isNotEmpty()) {
                 val keywords = builtInKeywords.mapNotNull { keyword ->
                     when (keyword.lowercase()) {
                         "porcupine" -> Porcupine.BuiltInKeyword.PORCUPINE
@@ -161,12 +167,68 @@ class WakeWordForegroundService : Service() {
                         }
                     }
                 }
+                allBuiltInKeywords.addAll(keywords)
+                Log.d(TAG, "Added ${keywords.size} built-in keywords: $builtInKeywords")
+            }
 
-                if (keywords.isNotEmpty()) {
-                    builder.setKeywords(keywords.toTypedArray())
-                } else {
+            // Add custom keywords
+            if (customKeywordPaths.isNotEmpty()) {
+                // We may receive any of the following variants from Dart:
+                // 1. assets/keywords/filename.ppn
+                // 2. keywords/filename.ppn (stripped 'assets/')
+                // 3. flutter_assets/assets/keywords/filename.ppn (already prefixed)
+                // Porcupine Java SDK cannot read directly from Flutter's compressed assets unless we give it
+                // an asset-relative path that it can open via AssetManager OR an extracted filesystem path.
+                // Empirically, due to Flutter placing all declared assets under assets/flutter_assets/, providing only
+                // the relative key (e.g. assets/keywords/file.ppn) fails inside the Porcupine builder.
+                // To make this robust across build variants (debug/release, obfuscation, split per ABI), we will:
+                //  (a) attempt to open each candidate asset path via AssetManager with several prefixes
+                //  (b) copy the asset to app's internal storage (filesDir) and pass the ABSOLUTE file path to Porcupine.
+                // This avoids AssetManager path ambiguity and matches Porcupine's documented allowance for filesystem paths.
+
+                val resolvedPaths = resolveAndMaterializeCustomKeywords(customKeywordPaths)
+                allKeywordPaths.addAll(resolvedPaths)
+                Log.d(TAG, "Resolved ${resolvedPaths.size} custom keyword file paths: $resolvedPaths")
+            }
+
+            // Determine target language from custom keyword filenames (defaults to English)
+            val targetLanguage: String = when {
+                customKeywordPaths.any { it.contains("_es_") || it.contains("/es/") } -> "es"
+                customKeywordPaths.any { it.contains("_fr_") || it.contains("/fr/") } -> "fr"
+                customKeywordPaths.any { it.contains("_de_") || it.contains("/de/") } -> "de"
+                else -> "en" // default to English for "help me" and other keywords
+            }
+
+            // For English keywords (including "help me"), use default model
+            if (targetLanguage == "en") {
+                Log.d(TAG, "Using default English Porcupine model for 'help me' and other English keywords")
+            } else {
+                // Try to resolve a language-specific model for non-English keywords
+                resolveAndSetModelForLanguage(builder, targetLanguage)
+            }
+
+            // Configure the builder based on what we have
+            when {
+                allBuiltInKeywords.isNotEmpty() && allKeywordPaths.isEmpty() -> {
+                    // Only built-in keywords
+                    builder.setKeywords(allBuiltInKeywords.toTypedArray())
+                    Log.i(TAG, "Using only built-in keywords: ${allBuiltInKeywords.size}")
+                }
+                allKeywordPaths.isNotEmpty() && allBuiltInKeywords.isEmpty() -> {
+                    // Only custom keywords
+                    builder.setKeywordPaths(allKeywordPaths.toTypedArray())
+                    Log.i(TAG, "Using only custom keywords: ${allKeywordPaths.size}")
+                }
+                allBuiltInKeywords.isNotEmpty() && allKeywordPaths.isNotEmpty() -> {
+                    // Mixed keywords - unfortunately Porcupine doesn't support mixing built-in and custom
+                    // So we'll prioritize custom keywords and log the limitation
+                    builder.setKeywordPaths(allKeywordPaths.toTypedArray())
+                    Log.w(TAG, "Mixed keywords detected. Using custom keywords (${allKeywordPaths.size}), built-in keywords ignored due to Porcupine limitation")
+                }
+                else -> {
                     // Fallback to default keywords
                     builder.setKeywords(arrayOf(Porcupine.BuiltInKeyword.PORCUPINE, Porcupine.BuiltInKeyword.PICOVOICE))
+                    Log.w(TAG, "No keywords configured, using default: PORCUPINE, PICOVOICE")
                 }
             }
 
@@ -176,6 +238,141 @@ class WakeWordForegroundService : Service() {
             Log.e(TAG, "Failed to initialize Porcupine", e)
             throw e
         }
+    }
+
+    /**
+     * Attempts to locate each provided custom keyword asset inside the Flutter asset bundle and copy
+     * it into internal storage, returning absolute filesystem paths suitable for Porcupine.
+     * Accepts flexible incoming path variants (with/without 'assets/' prefix, already prefixed, etc.).
+     */
+    private fun resolveAndMaterializeCustomKeywords(originalPaths: List<String>): List<String> {
+        val assetManager = applicationContext.assets
+        val outputPaths = mutableListOf<String>()
+
+        for (rawPath in originalPaths) {
+            try {
+                val candidateVariants = buildList {
+                    // Normalize input
+                    val trimmed = rawPath.removePrefix("/")
+                    // If already contains flutter_assets prefix, keep as-is
+                    if (trimmed.startsWith("flutter_assets/")) add(trimmed)
+                    // Common Flutter asset key forms
+                    add(trimmed)
+                    if (!trimmed.startsWith("assets/")) add("assets/$trimmed")
+                    // Full path inside APK assets folder
+                    add("flutter_assets/${trimmed}")
+                    if (!trimmed.startsWith("assets/")) add("flutter_assets/assets/${trimmed}")
+                }.distinct()
+
+                var foundStream: java.io.InputStream? = null
+                var usedVariant: String? = null
+                var lastError: Exception? = null
+
+                for (variant in candidateVariants) {
+                    try {
+                        foundStream = assetManager.open(variant)
+                        usedVariant = variant
+                        Log.d(TAG, "Successfully opened keyword asset variant: $variant")
+                        break
+                    } catch (e: Exception) {
+                        lastError = e
+                    }
+                }
+
+                if (foundStream == null) {
+                    Log.e(TAG, "Failed to locate custom keyword asset: $rawPath. Tried: $candidateVariants", lastError)
+                    continue
+                }
+
+                // Copy to internal storage (idempotent if unchanged by comparing sizes)
+                val fileName = rawPath.substringAfterLast('/')
+                val outFile = java.io.File(filesDir, fileName)
+                var shouldCopy = true
+                if (outFile.exists()) {
+                    // quick size check to skip unnecessary overwrite
+                    val existingSize = outFile.length()
+                    val available = foundStream.available()
+                    if (existingSize == available.toLong()) {
+                        shouldCopy = false
+                        Log.d(TAG, "Reusing existing extracted keyword file: ${outFile.absolutePath}")
+                    }
+                }
+                if (shouldCopy) {
+                    foundStream.use { input ->
+                        java.io.FileOutputStream(outFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    Log.i(TAG, "Extracted keyword '${fileName}' from '$usedVariant' to '${outFile.absolutePath}'")
+                }
+                outputPaths.add(outFile.absolutePath)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing custom keyword asset: $rawPath", e)
+            }
+        }
+
+        if (outputPaths.isEmpty()) {
+            Log.e(TAG, "No custom keyword files could be resolved. Porcupine will fail to start.")
+        }
+        return outputPaths
+    }
+
+    /**
+     * Attempts to locate and extract a Porcupine model file for the given language code (e.g., "es").
+     * Expected naming convention: porcupine_params_<lang>.pv (Picovoice standard) placed in Flutter assets.
+     * If found, sets the model path on the provided builder. If not found, logs detailed guidance.
+     */
+    private fun resolveAndSetModelForLanguage(builder: Porcupine.Builder, languageCode: String) {
+        val fileName = "porcupine_params_${languageCode}.pv"
+        val assetCandidates = listOf(
+            // Most common locations (developer should add one of these to pubspec assets)
+            fileName,
+            "assets/$fileName",
+            "porcupine/$fileName",
+            "assets/porcupine/$fileName",
+            "models/$fileName",
+            "assets/models/$fileName",
+            // Flutter embedded prefixes
+            "flutter_assets/$fileName",
+            "flutter_assets/assets/$fileName",
+            "flutter_assets/porcupine/$fileName",
+            "flutter_assets/assets/porcupine/$fileName",
+        ).distinct()
+
+        val extracted = extractFirstMatchingAsset(assetCandidates, fileName)
+        if (extracted != null) {
+            Log.i(TAG, "Using ${languageCode.uppercase()} Porcupine model at: $extracted")
+            builder.setModelPath(extracted)
+        } else {
+            Log.e(
+                TAG,
+                "Could not find language model '$fileName' for language '$languageCode'. " +
+                        "Add it to pubspec assets and rebuild. Falling back to default English model which may cause a language mismatch."
+            )
+        }
+    }
+
+    /**
+     * Tries each candidate asset key, extracting the first successful one into internal storage.
+     */
+    private fun extractFirstMatchingAsset(candidates: List<String>, outFileName: String): String? {
+        val assetManager = applicationContext.assets
+        var lastError: Exception? = null
+        for (variant in candidates) {
+            try {
+                assetManager.open(variant).use { input ->
+                    val outFile = java.io.File(filesDir, outFileName)
+                    // Always overwrite to avoid stale model mismatches across updates
+                    java.io.FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                    Log.d(TAG, "Extracted model asset variant: $variant -> ${outFile.absolutePath}")
+                    return outFile.absolutePath
+                }
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+        Log.w(TAG, "Model asset not found. Tried variants: $candidates", lastError)
+        return null
     }
 
     private fun startAudioRecording() {
@@ -236,7 +433,14 @@ class WakeWordForegroundService : Service() {
         
         // Determine which keyword was detected
         val detectedKeyword = if (customKeywordPaths.isNotEmpty()) {
-            "custom_keyword_$keywordIndex"
+            // For custom keywords, map based on the filename or order
+            val customPath = customKeywordPaths.getOrNull(keywordIndex)
+            when {
+                customPath != null && customPath.contains("help-me") -> "help me"
+                customPath != null && customPath.contains("b-chao") -> "b chao"
+                keywordIndex == 0 -> "help me" // Default first custom keyword
+                else -> "custom_keyword_$keywordIndex"
+            }
         } else {
             builtInKeywords.getOrNull(keywordIndex) ?: "unknown_keyword"
         }

@@ -1,77 +1,66 @@
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const { JWT_SECRET,JWT_REFRESH_SECRET } = require('../config/env');
+const jwt = require("jsonwebtoken");
+const User = require("../models/User");
+const {
+  JWT_SECRET,
+  JWT_REFRESH_SECRET,
+} = require("../config/env");
 
+const twilio = require("twilio");
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+// ✅ Send OTP
 exports.sendOtp = async (req, res, next) => {
   try {
     const { phone } = req.body;
-    let user = await User.findOne({ phone });
 
+    // auto-register user if not exists
+    let user = await User.findOne({ phone });
     if (!user) {
-      // auto-register with phone only
-      try {
-        user = await User.create({ phone });
-      } catch (error) {
-        console.log(error);
-      }
+      user = await User.create({ phone });
     }
 
-    // Generate 4-digit OTP
-    const otp = Math.floor(1000 + Math.random() * 9000).toString();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+    // Send OTP via Twilio Verify
+    const verification = await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({ to: phone, channel: "sms" });
 
-    user.otp = { code: otp, expiresAt };
-    await user.save();
-
-    // TODO: integrate SMS provider (Twilio, AWS SNS, etc.)
-    console.log(`OTP for ${phone}: ${otp}`);
-
-    res.json({ message: 'OTP sent successfully' });
+    res.json({ message: "OTP sent successfully", sid: verification.sid });
   } catch (err) {
+    console.error(err);
     next(err);
   }
 };
 
-
+// ✅ Verify OTP
 exports.verifyOtp = async (req, res, next) => {
   try {
     const { phone, otp } = req.body;
+
+    const verificationCheck = await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks.create({ to: phone, code: otp });
+
+    if (verificationCheck.status !== "approved") {
+      return res.status(400).json({ message: "Invalid or expired OTP" });
+    }
+
+    // User exists for sure
     const user = await User.findOne({ phone });
 
-    if (!user || !user.otp) {
-      return res.status(400).json({ message: 'OTP not found. Please request again.' });
-    }
+    // Generate tokens
+    const token = jwt.sign({ id: user._id, phone: user.phone }, JWT_SECRET, {
+      expiresIn: "15m",
+    });
 
-    if (user.otp.expiresAt < Date.now()) {
-      return res.status(400).json({ message: 'OTP expired' });
-    }
-
-    if (user.otp.code !== otp) {
-      return res.status(400).json({ message: 'Invalid OTP' });
-    }
-
-    // Clear OTP after successful login
-    user.otp = undefined;
-    await user.save();
-
-    // Access token (short-lived, e.g., 15 minutes)
-    const token = jwt.sign(
-      { id: user._id, phone: user.phone },
-      JWT_SECRET,
-      { expiresIn: '15m' }
-    );
-
-    // Refresh token (long-lived, e.g., 7 days)
-    const refreshToken = jwt.sign(
-      { id: user._id },
-      JWT_REFRESH_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    console.log(`User ${phone} logged in`);
+    const refreshToken = jwt.sign({ id: user._id }, JWT_REFRESH_SECRET, {
+      expiresIn: "7d",
+    });
 
     res.json({
+      message: "OTP verified successfully",
       token,
       refreshToken,
       user: {
@@ -81,6 +70,7 @@ exports.verifyOtp = async (req, res, next) => {
       },
     });
   } catch (err) {
+    console.error(err);
     next(err);
   }
 };

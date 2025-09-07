@@ -39,7 +39,7 @@ class AuthUtils {
     return _singleton;
   }
 
-  static const String baseUrl = "http://localhost:8000"; // your backend
+  static const String baseUrl = "https://nari-shakti.onrender.com"; // your backend
 
   String? _jwt;
   // ignore: unused_field

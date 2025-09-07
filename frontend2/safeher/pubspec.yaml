@@ -82,6 +82,8 @@ flutter:
     - .env
     - images/
     - assets/wake_words/
+    - assets/keywords/
+    - assets/help-me_en_android_v3_0_0.ppn
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

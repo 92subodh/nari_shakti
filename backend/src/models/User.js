@@ -13,10 +13,6 @@ const userSchema = new mongoose.Schema(
     trustedContacts: [{ name: String, phone: String }],
     safeWord: { type: String },
     antiShutdownPassword: { type: String },
-    otp: {
-      code: String,
-      expiresAt: Date,
-    },
   },
   { timestamps: true }
 );
